@@ -1,5 +1,7 @@
 # c&e — Causa & Efecto
 
+[![tests](https://github.com/dcpracmatic-prog/cande/actions/workflows/tests.yml/badge.svg)](https://github.com/dcpracmatic-prog/cande/actions/workflows/tests.yml)
+
 Solver heurístico para **Maximum Weight Independent Set (MWIS)**, con implementación Python y backend C++17. Ambos ofrecen evaluación de pesos en modo `float` y racional exacto.
 
 ## Características
