@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Demostración rápida del MVP c&e."""
 
-from ce import Graph, MWISSolver, FloatEvaluator, ExactEvaluator, solve_both
+from ce import Graph, solve_both
 
 
 def main():

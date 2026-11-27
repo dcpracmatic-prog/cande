@@ -1,16 +1,64 @@
 #include "ce/evaluator.hpp"
 #include "ce/graph.hpp"
-#include "ce/solver.hpp"
 
 #include <cassert>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
+#include <fstream>
 #include <iostream>
 #include <limits>
 #include <random>
+#include <sstream>
+#include <string>
+#include <utility>
 #include <vector>
 
+// El solver nuevo es un programa autocontenido (src/solver.cpp) y se prueba
+// a través de su binario: la prueba escribe la instancia en formato de texto
+// (n m, aristas, pesos en micro-unidades) y lee weight/vertices de su salida.
+#ifndef CE_MWIS_BIN
+#define CE_MWIS_BIN "./ce_mwis"
+#endif
+
 using namespace ce;
+
+struct BinResult {
+    int64_t weight_micro = -1;
+    std::vector<int> vertices;
+};
+
+static BinResult run_solver_bin(int n, const std::vector<std::pair<int, int>>& edges,
+                                const std::vector<int64_t>& weights_micro) {
+    const std::string in_path = "/tmp/ce_test_exact_instance.txt";
+    const std::string out_path = "/tmp/ce_test_exact_out.txt";
+    {
+        std::ofstream out(in_path);
+        out << n << ' ' << edges.size() << '\n';
+        for (const auto& e : edges) out << e.first << ' ' << e.second << '\n';
+        for (size_t i = 0; i < weights_micro.size(); ++i) {
+            if (i) out << ' ';
+            out << weights_micro[i];
+        }
+        out << '\n';
+    }
+    const std::string cmd = std::string(CE_MWIS_BIN) + " --seed 42 --reps 3 \"" +
+                            in_path + "\" > \"" + out_path + "\" 2>&1";
+    const int rc = std::system(cmd.c_str());
+    assert(rc == 0);
+    BinResult r;
+    std::ifstream in(out_path);
+    std::string line;
+    while (std::getline(in, line)) {
+        if (line.rfind("weight ", 0) == 0) r.weight_micro = std::stoll(line.substr(7));
+        else if (line.rfind("vertices", 0) == 0) {
+            std::istringstream iss(line.substr(8));
+            int v;
+            while (iss >> v) r.vertices.push_back(v);
+        }
+    }
+    return r;
+}
 
 int main() {
     ExactEvaluator ev;
@@ -36,18 +84,17 @@ int main() {
     std::mt19937_64 rng_graph(7);
     for (int i = 0; i < 400; ++i)
         weights400.push_back(std::round(ud(rng_graph) * 1e6) / 1e6);
-    Graph isolated400(400, {}, weights400);
-    SolverConfig cfg400;
-    cfg400.n_restarts = 1;
-    cfg400.n_perturbations = 0;
-    cfg400.max_local_passes = 0;
-    MWISSolver<ExactEvaluator> solver400(ExactEvaluator{}, cfg400);
-    const auto sol400 = solver400.solve(isolated400);
-    assert(sol400.vertices.size() == 400);
-    assert(sol400.weight.num > 0);
-    long double sum400 = 0.0L;
-    for (double w : weights400) sum400 += static_cast<long double>(w);
-    assert(std::fabs(sol400.weight.to_double() - static_cast<double>(sum400)) < 1e-9);
+    std::vector<int64_t> w400micro;
+    w400micro.reserve(400);
+    int64_t sum400micro = 0;
+    for (double w : weights400) {
+        const int64_t mu = std::llround(w * 1e6);
+        w400micro.push_back(mu);
+        sum400micro += mu;
+    }
+    const auto r400 = run_solver_bin(400, {}, w400micro);
+    assert(r400.vertices.size() == 400);
+    assert(r400.weight_micro == sum400micro);
 
     // Regresión: 1e20 y DBL_MAX son finitos y se convierten sin shifts UB.
     const auto large = ev.from_weight(1e20);
@@ -76,36 +123,23 @@ int main() {
     assert(rejected_nan);
 
     // Un peso negativo nunca debe aparecer en un MWIS óptimo.
-    Graph g(3, {}, std::vector<double>{10.0, -1.0, 9.0});
-    SolverConfig cfg;
-    cfg.n_restarts = 3;
-    cfg.n_perturbations = 2;
-    cfg.seed = 17;
-    MWISSolver<FloatEvaluator> float_solver(FloatEvaluator{}, cfg);
-    MWISSolver<ExactEvaluator> exact_solver(ExactEvaluator{}, cfg);
-    const auto sf = float_solver.solve(g);
-    const auto se = exact_solver.solve(g);
-    assert((sf.vertices == std::vector<int>{0, 2}));
-    assert((se.vertices == std::vector<int>{0, 2}));
-    assert(std::fabs(sf.weight - 19.0) < 1e-12);
-    assert(std::fabs(se.weight.to_double() - 19.0) < 1e-12);
+    const auto rneg = run_solver_bin(3, {}, {10000000, -1000000, 9000000});
+    assert((rneg.vertices == std::vector<int>{0, 2}));
+    assert(rneg.weight_micro == 19000000);
 
     // Si todos los pesos son negativos, la solución vacía de peso cero es óptima.
-    Graph all_negative(2, {{0, 1}}, std::vector<double>{-2.0, -1.0});
-    const auto sn = exact_solver.solve(all_negative);
-    assert(sn.vertices.empty());
-    assert(ev.compare(sn.weight, ev.zero()) == 0);
+    const auto rall = run_solver_bin(2, {{0, 1}}, {-2000000, -1000000});
+    assert(rall.vertices.empty());
+    assert(rall.weight_micro == 0);
 
     // Los ceros se pueden seleccionar por el desempate de cardinalidad.
-    Graph zeros(3, {{0, 1}}, std::vector<double>{0.0, 0.0, 0.0});
-    const auto sz = exact_solver.solve(zeros);
-    assert((sz.vertices == std::vector<int>{0, 2}));
-    assert(ev.compare(sz.weight, ev.zero()) == 0);
+    const auto rz = run_solver_bin(3, {{0, 1}}, {0, 0, 0});
+    assert((rz.vertices == std::vector<int>{0, 2}));
+    assert(rz.weight_micro == 0);
 
-    Graph zero_path(3, {{0, 1}, {1, 2}}, std::vector<double>{0.0, 0.0, 0.0});
-    const auto zp = exact_solver.solve(zero_path);
-    assert((zp.vertices == std::vector<int>{0, 2}));
-    assert(ev.compare(zp.weight, ev.zero()) == 0);
+    const auto rzp = run_solver_bin(3, {{0, 1}, {1, 2}}, {0, 0, 0});
+    assert((rzp.vertices == std::vector<int>{0, 2}));
+    assert(rzp.weight_micro == 0);
 
     std::cout << "C++ exact evaluator regression tests: OK\n";
     return 0;

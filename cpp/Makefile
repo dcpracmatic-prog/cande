@@ -1,32 +1,29 @@
 # Makefile simple (alternativa a CMake)
 CXX      ?= g++
-CXXFLAGS ?= -std=c++17 -O2 -Wall -Wextra -Iinclude
+CXXFLAGS ?= -std=c++17 -O3 -Wall -Wextra -Iinclude
 LDFLAGS  ?=
-TEST_CXXFLAGS ?= -std=c++17 -O0 -Wall -Wextra -Iinclude
-DEPFLAGS ?= -MMD -MP
 
-SRCS = src/evaluator.cpp src/solver.cpp src/main.cpp
-OBJS = $(SRCS:.cpp=.o)
+# El solver es autocontenido en src/solver.cpp (AdjustedSolver es6, con su
+# propio main). El main.cpp y solver.hpp del solver viejo quedaron fuera del
+# build (ver NOTA.md).
 TARGET = ce_mwis
-TEST_TARGET = test_exact
+TEST_BIN = test_exact
 
 .PHONY: all clean test
 
 all: $(TARGET)
 
-test: $(TARGET) $(TEST_TARGET)
-	./$(TEST_TARGET)
+# Pruebas propias de C++: regresiones del evaluador racional exacto y del
+# solver nuevo (a través de su binario). test_exact.cpp usa ce_mwis, así que
+# el binario se construye primero.
+test: $(TARGET) $(TEST_BIN)
+	./$(TEST_BIN)
 
-$(TEST_TARGET): tests/test_exact.cpp src/evaluator.o src/solver.o
-	$(CXX) $(TEST_CXXFLAGS) $(DEPFLAGS) -MF $(TEST_TARGET).d -o $@ tests/test_exact.cpp src/evaluator.o src/solver.o $(LDFLAGS)
+$(TARGET): src/solver.cpp
+	$(CXX) $(CXXFLAGS) -o $@ src/solver.cpp $(LDFLAGS)
 
-$(TARGET): $(OBJS)
-	$(CXX) $(CXXFLAGS) -o $@ $^ $(LDFLAGS)
-
-src/%.o: src/%.cpp
-	$(CXX) $(CXXFLAGS) $(DEPFLAGS) -c -o $@ $<
-
--include $(OBJS:.o=.d) $(TEST_TARGET).d
+$(TEST_BIN): tests/test_exact.cpp src/evaluator.cpp $(TARGET)
+	$(CXX) $(CXXFLAGS) -DCE_MWIS_BIN='"$(CURDIR)/ce_mwis"' -o $@ tests/test_exact.cpp src/evaluator.cpp $(LDFLAGS)
 
 clean:
-	rm -f $(OBJS) $(OBJS:.o=.d) $(TARGET) $(TEST_TARGET) $(TEST_TARGET).d
+	rm -f $(TARGET) $(TEST_BIN)

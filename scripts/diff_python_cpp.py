@@ -2,9 +2,11 @@
 """
 Prueba diferencial Python ↔ C++.
 
-Genera una instancia en Python, la serializa y entrega exactamente ese mismo
-JSON a C++. Compara factibilidad y reporta diferencias de calidad entre las
-trayectorias heurísticas; no presupone que ambos RNG produzcan la misma solución.
+Genera una instancia en Python, la serializa en el formato de texto del
+binario C++ (n m, aristas, pesos en micro-unidades) y entrega exactamente
+esa misma instancia a C++. Compara factibilidad y reporta diferencias de
+calidad entre las trayectorias heurísticas; no presupone que ambos RNG
+produzcan la misma solución.
 
 Uso:
   cd c_and_e/cpp && make
@@ -25,7 +27,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from ce import Graph, MWISSolver, FloatEvaluator, ExactEvaluator, SolverConfig
+from ce import Graph, solve_both
 
 
 def make_instance(n: int, dens: float, seed: int):
@@ -37,13 +39,11 @@ def make_instance(n: int, dens: float, seed: int):
 
 
 def run_python(g: Graph, seed: int, restarts: int = 6, perturbs: int = 8):
-    cfg = SolverConfig(n_restarts=restarts, n_perturbations=perturbs, seed=seed)
+    # El solver nuevo es exacto en micro-unidades: una sola corrida da la
+    # presentación float y la exacta de la misma solución.
     t0 = time.perf_counter()
-    sol_f = MWISSolver(FloatEvaluator(), config=cfg).solve(g)
-    t_f = (time.perf_counter() - t0) * 1000
-    t0 = time.perf_counter()
-    sol_e = MWISSolver(ExactEvaluator(), config=cfg).solve(g)
-    t_e = (time.perf_counter() - t0) * 1000
+    sol_f, sol_e = solve_both(g, n_restarts=restarts, n_perturbations=perturbs, seed=seed)
+    dt = (time.perf_counter() - t0) * 1000
     return {
         "float_vertices": sorted(sol_f.vertices),
         "float_weight": float(sol_f.weight),
@@ -51,27 +51,46 @@ def run_python(g: Graph, seed: int, restarts: int = 6, perturbs: int = 8):
         "exact_vertices": sorted(sol_e.vertices),
         "exact_weight": float(sol_e.weight),
         "exact_independent": g.is_independent(sol_e.vertices),
-        "time_float_ms": t_f,
-        "time_exact_ms": t_e,
+        "time_float_ms": dt,
+        "time_exact_ms": dt,
     }
 
 
-def run_cpp(bin_path: Path, graph_path: Path, seed: int,
+def write_text_instance(path: Path, g: Graph):
+    edges = [[u, v] for u in range(g.n) for v in g.adj[u] if u < v]
+    w_micro = [int(round(w * 1_000_000)) for w in g.weights]
+    lines = [f"{g.n} {len(edges)}"]
+    lines += [f"{u} {v}" for u, v in edges]
+    lines.append(" ".join(str(w) for w in w_micro))
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def run_cpp(bin_path: Path, txt_path: Path, seed: int,
             restarts: int = 6, perturbs: int = 8):
-    """Ejecuta C++ sobre el mismo JSON utilizado para resolver en Python."""
+    """Ejecuta C++ sobre el mismo grafo utilizado para resolver en Python."""
     cmd = [
         str(bin_path),
-        "--graph", str(graph_path),
         "--seed", str(seed),
+        "--reps", "3",
         "--restarts", str(restarts),
-        "--perturbs", str(perturbs),
-        "--json",
+        "--perturbations", str(perturbs),
+        "--mode", "multi",
+        str(txt_path),
     ]
     try:
         out = subprocess.check_output(cmd, text=True, timeout=60)
-        return json.loads(out.strip().splitlines()[-1])
     except Exception as e:
         return {"error": str(e)}
+    weight = None
+    vertices = []
+    for line in out.splitlines():
+        if line.startswith("weight "):
+            weight = int(line.split()[1])
+        elif line.startswith("vertices"):
+            vertices = [int(x) for x in line.split()[1:]]
+    if weight is None:
+        return {"error": "sin línea weight: " + out[:200]}
+    return {"weight_micro": weight, "vertices": vertices}
 
 
 def main():
@@ -90,9 +109,13 @@ def main():
             bin_path.chmod(0o755)
         except Exception:
             pass
-        # verificar si realmente se puede ejecutar
+        # verificar si realmente se puede ejecutar (instancia mínima en texto)
         try:
-            subprocess.check_output([str(bin_path), "--n", "4", "--seed", "1", "--json"], timeout=10)
+            with tempfile.TemporaryDirectory(prefix="ce_diff_") as tmp:
+                tiny = Path(tmp) / "tiny.txt"
+                tiny.write_text("2 1\n0 1\n1000000 1000000\n", encoding="utf-8")
+                out = subprocess.check_output([str(bin_path), str(tiny)], text=True, timeout=10)
+                assert "weight 1000000" in out
         except Exception as e:
             print(f"[INFO] Binario C++ presente pero no ejecutable en este entorno: {e}")
             print("       Se reportan solo resultados Python.\n")
@@ -125,22 +148,21 @@ def main():
             # Serializar la instancia generada en Python; no generar un segundo
             # grafo con mt19937 (que no reproduce random.Random de Python).
             with tempfile.TemporaryDirectory(prefix="ce_diff_") as tmp:
-                graph_path = Path(tmp) / "instance.json"
-                graph_path.write_text(json.dumps({
-                    "n": g.n,
-                    "edges": [[u, v] for u in range(g.n) for v in g.adj[u] if u < v],
-                    "weights": [float(w) for w in g.weights],
-                }), encoding="utf-8")
-                cpp = run_cpp(bin_path, graph_path, seed)
+                txt_path = Path(tmp) / "instance.txt"
+                write_text_instance(txt_path, g)
+                cpp = run_cpp(bin_path, txt_path, seed)
             if "error" in cpp:
                 print(f"         C++ error: {cpp['error']}")
                 all_ok = False
             else:
-                cpp_ok = cpp.get("float_independent") and cpp.get("exact_independent")
-                d_float = cpp.get("float_weight", 0.0) - py["float_weight"]
-                d_exact = cpp.get("exact_weight", 0.0) - py["exact_weight"]
-                print(f"         C++ misma_instancia=True float_size={cpp.get('float_size')} "
-                      f"exact_size={cpp.get('exact_size')} dW_float={d_float:+.6g} "
+                verts = set(cpp["vertices"])
+                cpp_ok = all(v not in g.adj[u] for u in verts for v in verts if u != v) and \
+                    all(u not in g.adj[u] for u in verts)
+                cpp_w = cpp["weight_micro"] / 1_000_000
+                d_float = cpp_w - py["float_weight"]
+                d_exact = cpp_w - py["exact_weight"]
+                print(f"         C++ misma_instancia=True float_size={len(cpp['vertices'])} "
+                      f"exact_size={len(cpp['vertices'])} dW_float={d_float:+.6g} "
                       f"dW_exact={d_exact:+.6g} | factible={bool(cpp_ok)}")
                 # Las semillas se mantienen, pero Python random.Random y C++
                 # mt19937 siguen trayectorias distintas. Se compara factibilidad

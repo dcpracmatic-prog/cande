@@ -2,7 +2,7 @@
 
 from .graph import Graph
 from .evaluator import FloatEvaluator, ExactEvaluator, WeightEvaluator
-from .solver import MWISSolver, Solution, SolverConfig, is_better_solution
+from .solver import AdjustedSolver, better_solution, objective
 from .utils import solve_both
 from .exact import solve_exact, ExactResult
 from .bounds import greedy_clique_cover_upper_bound, greedy_clique_cover_upper_bound_exact
@@ -12,10 +12,9 @@ __all__ = [
     "FloatEvaluator",
     "ExactEvaluator",
     "WeightEvaluator",
-    "MWISSolver",
-    "Solution",
-    "SolverConfig",
-    "is_better_solution",
+    "AdjustedSolver",
+    "better_solution",
+    "objective",
     "solve_both",
     "solve_exact",
     "ExactResult",
