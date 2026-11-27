@@ -4,6 +4,12 @@
 Ejecuta varias semillas del solver sobre cada instancia fija, no grafos distintos por semilla. Guarda JSON reproducible.
 No es un benchmark de estado del arte: mide el gap de C&E contra su óptimo
 exacto en instancias donde branch-and-bound puede terminar.
+
+Portado a la API nueva (AdjustedSolver es6, exacto en micro-unidades):
+`solve_both` corre el solver una vez y devuelve la misma solución en dos
+presentaciones (float en unidades y exacta como Fraction). Los modos
+'float' y 'exact' de este script ya no son dos solvers distintos: son esas
+dos presentaciones de la misma corrida, por eso sus filas coinciden.
 """
 from __future__ import annotations
 import argparse, json, statistics, time
@@ -11,7 +17,7 @@ from pathlib import Path
 import sys
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
-from ce import MWISSolver, FloatEvaluator, ExactEvaluator, SolverConfig, solve_exact
+from ce import ExactEvaluator, solve_both, solve_exact
 from ce.instances import FAMILIES, make_instance
 
 
@@ -38,9 +44,11 @@ def main():
             g = type(g).from_edges(n, [(u,v) for u in range(n) for v in g.adj[u] if u < v], signed_weights)
         t0=time.perf_counter(); optimum=solve_exact(g); exact_ms=(time.perf_counter()-t0)*1000
         for solver_seed in range(args.seeds):
-          cfg=SolverConfig(n_restarts=args.restarts,n_perturbations=args.perturbations,seed=solver_seed)
-          for mode, evaluator in [('float',FloatEvaluator()),('exact',ExactEvaluator())]:
-            t0=time.perf_counter(); sol=MWISSolver(evaluator,config=cfg).solve(g); elapsed=(time.perf_counter()-t0)*1000
+          for mode in ('float', 'exact'):
+            t0=time.perf_counter()
+            sol_f, sol_e = solve_both(g, n_restarts=args.restarts, n_perturbations=args.perturbations, seed=solver_seed)
+            sol = sol_f if mode == 'float' else sol_e
+            elapsed=(time.perf_counter()-t0)*1000
             exact_eval=ExactEvaluator()
             achieved_exact=sum((exact_eval.from_weight(g.weights[v]) for v in sol.vertices), exact_eval.zero())
             weight=float(achieved_exact); opt=float(optimum.weight)
@@ -53,7 +61,7 @@ def main():
                          'heuristic_vertices':sol.vertices,'independent':g.is_independent(sol.vertices),
                          'exact_nodes':optimum.nodes,'exact_pruned':optimum.pruned})
     out=ROOT/args.out
-    out.write_text(json.dumps({'schema':'ce-bench-families-v2','signed_weights':args.signed_weights,'solver_seeds':args.seeds,'graph_seeds':args.graph_seeds,'rows':rows},indent=2),encoding='utf-8')
+    out.write_text(json.dumps({'schema':'ce-bench-families-v3','note':'Portado al AdjustedSolver es6: los modos float/exact son dos presentaciones de la misma corrida exacta en micro-unidades.','signed_weights':args.signed_weights,'solver_seeds':args.seeds,'graph_seeds':args.graph_seeds,'rows':rows},indent=2),encoding='utf-8')
     for mode in ('float','exact'):
       subset=[r for r in rows if r['mode']==mode]
       gaps=[r['gap_ratio'] for r in subset]; times=[r['time_ms'] for r in subset]

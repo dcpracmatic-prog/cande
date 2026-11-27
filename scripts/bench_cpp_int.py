@@ -1,38 +1,67 @@
 #!/usr/bin/env python3
 """Benchmark reproducible del código actual (cpp_int), separado de V6.
 
-Mide Python/C++ float y exact sobre el mismo JSON. Informa mediana y p95 de
-múltiples repeticiones. No compara calidad contra solvers externos.
+Mide Python/C++ sobre la misma instancia (JSON de referencia y su texto
+equivalente para el binario). Informa mediana y p95 de múltiples
+repeticiones. No compara calidad contra solvers externos.
+
+Portado a la API nueva (AdjustedSolver es6, exacto en micro-unidades):
+Python corre `solve_both` y C++ el binario nuevo (`ce_mwis --mode multi`
+sobre instancia en texto). Los modos 'float' y 'exact' ya no son dos
+solvers distintos: son dos presentaciones de la misma solución exacta.
 """
 from __future__ import annotations
 import argparse, json, random, statistics, subprocess, sys, time
 from pathlib import Path
 ROOT=Path(__file__).resolve().parents[1]
 sys.path.insert(0,str(ROOT/'src'))
-from ce import Graph, MWISSolver, FloatEvaluator, ExactEvaluator, SolverConfig
+from ce import Graph, solve_both
 
 
 def timed_python(g, seed, mode, repeats, restarts, perturbations):
-    ev=FloatEvaluator() if mode=='float' else ExactEvaluator()
-    cfg=SolverConfig(n_restarts=restarts,n_perturbations=perturbations,seed=seed)
-    MWISSolver(ev,config=cfg).solve(g)
+    solve_both(g, n_restarts=restarts, n_perturbations=perturbations, seed=seed)
     samples=[]; sol=None
     for _ in range(repeats):
-        t=time.perf_counter(); sol=MWISSolver(ev,config=cfg).solve(g)
+        t=time.perf_counter()
+        sol_f, sol_e = solve_both(g, n_restarts=restarts, n_perturbations=perturbations, seed=seed)
+        sol = sol_f if mode == 'float' else sol_e
         samples.append((time.perf_counter()-t)*1000)
     return samples,sol
 
 
-def timed_cpp(binary, graph_path, seed, mode, repeats, restarts, perturbations):
-    cmd=[str(binary),'--graph',str(graph_path),'--seed',str(seed),'--restarts',str(restarts),
-         '--perturbs',str(perturbations),'--only',mode,'--json']
+def write_text_instance(path, g):
+    edges = [[u, v] for u in range(g.n) for v in g.adj[u] if u < v]
+    w_micro = [int(round(w * 1_000_000)) for w in g.weights]
+    lines = [f"{g.n} {len(edges)}"]
+    lines += [f"{u} {v}" for u, v in edges]
+    lines.append(" ".join(str(w) for w in w_micro))
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def parse_cpp_out(out):
+    weight = None; time_s = None; vertices = []
+    for line in out.splitlines():
+        if line.startswith("weight "):
+            weight = int(line.split()[1])
+        elif line.startswith("time_s "):
+            time_s = float(line.split()[1])
+        elif line.startswith("vertices"):
+            vertices = [int(x) for x in line.split()[1:]]
+    if weight is None or time_s is None:
+        raise ValueError("salida C++ sin weight/time_s: " + out[:200])
+    return {"weight": weight / 1_000_000, "vertices": vertices, "time_s": time_s}
+
+
+def timed_cpp(binary, txt_path, seed, mode, repeats, restarts, perturbations):
+    cmd=[str(binary),'--seed',str(seed),'--reps','3','--mode','multi',
+         '--restarts',str(restarts),'--perturbations',str(perturbations),str(txt_path)]
     subprocess.run(cmd,check=True,capture_output=True,text=True,timeout=300)
     internal=[]; wall=[]; payload=None
     for _ in range(repeats):
         t=time.perf_counter(); out=subprocess.run(cmd,check=True,capture_output=True,text=True,timeout=300)
         wall.append((time.perf_counter()-t)*1000)
-        payload=json.loads(out.stdout.strip().splitlines()[-1])
-        internal.append(payload['elapsed_ms_float' if mode=='float' else 'elapsed_ms_exact'])
+        payload=parse_cpp_out(out.stdout)
+        internal.append(payload['time_s']*1000)
     return internal,wall,payload
 
 
@@ -64,21 +93,24 @@ def main():
         g=Graph.from_edges(n,edges,weights)
         gp=inst_dir/f'er_n{n}_d{args.density:g}_s{seed}.json'
         gp.write_text(json.dumps({'n':n,'edges':edges,'weights':weights},separators=(',',':')))
+        tp=inst_dir/f'er_n{n}_d{args.density:g}_s{seed}.txt'
+        write_text_instance(tp, g)
         for mode in ('float','exact'):
           py_samples,py_sol=timed_python(g,seed,mode,args.repeats,args.restarts,args.perturbations)
-          cpp_internal,cpp_wall,cpp_payload=timed_cpp(binary,gp,seed,mode,args.repeats,args.restarts,args.perturbations)
+          cpp_internal,cpp_wall,cpp_payload=timed_cpp(binary,tp,seed,mode,args.repeats,args.restarts,args.perturbations)
           row={'n':n,'m':len(edges),'seed':seed,'density':args.density,'mode':mode,
                'python':stats(py_samples),'cpp_internal':stats(cpp_internal),'cpp_wall':stats(cpp_wall),
-               'python_weight':float(py_sol.weight),'cpp_weight':cpp_payload['float_weight' if mode=='float' else 'exact_weight'],
+               'python_weight':float(py_sol.weight),'cpp_weight':cpp_payload['weight'],
                'python_independent':g.is_independent(py_sol.vertices),
-               'cpp_independent':cpp_payload['float_independent' if mode=='float' else 'exact_independent'],
-               'same_graph_file':str(gp.relative_to(ROOT))}
+               'cpp_independent':g.is_independent(cpp_payload['vertices']),
+               'same_graph_file':str(gp.relative_to(ROOT)),
+               'same_graph_txt':str(tp.relative_to(ROOT))}
           row['speedup_python_over_cpp_internal']=row['python']['median_ms']/max(row['cpp_internal']['median_ms'],1e-12)
           rows.append(row)
           print(f"n={n:4d} seed={seed:3d} {mode:5s} Py={row['python']['median_ms']:.3f}ms "
                 f"C++={row['cpp_internal']['median_ms']:.3f}ms wall={row['cpp_wall']['median_ms']:.3f}ms "
                 f"speedup={row['speedup_python_over_cpp_internal']:.2f}x feasible={row['python_independent'] and row['cpp_independent']}",flush=True)
-    payload={'schema':'ce-cpp-int-benchmark-v1','note':'Mediciones nuevas sobre cpp_int; no comparables directamente con V6 int64.',
+    payload={'schema':'ce-cpp-int-benchmark-v2','note':'Portado al AdjustedSolver es6 (exacto en micro-unidades, float/exact son presentaciones de la misma solucion); C++ con --mode multi, 3 reps.',
              'repeats':args.repeats,'restarts':args.restarts,'perturbations':args.perturbations,'rows':rows}
     out=ROOT/args.out; out.write_text(json.dumps(payload,indent=2),encoding='utf-8')
     print(f'saved: {out}')

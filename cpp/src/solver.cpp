@@ -476,7 +476,7 @@ int main(int argc, char** argv) {
         else if (!a.empty() && a[0] != '-') input = a;
         else { std::cerr << "argumento desconocido: " << a << "\n"; return 2; }
     }
-    if (input.empty()) { std::cerr << "uso: refactor_v1 <instancia.txt> [--seed N]\n"; return 2; }
+    if (input.empty()) { std::cerr << "uso: ce_mwis <instancia.txt> [--seed N] [--reps R] [--mode multi|cont]\n"; return 2; }
 
     std::ifstream in(input);
     if (!in) { std::cerr << "no puedo abrir " << input << "\n"; return 2; }

@@ -12,6 +12,7 @@ dist/
 *.d
 cpp/ce_mwis
 cpp/test_exact
+cpp/prueba_exacta
 
 # Generated benchmark output and instances
 benchmarks/
