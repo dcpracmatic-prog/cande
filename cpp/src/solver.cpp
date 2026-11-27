@@ -1,424 +1,566 @@
-/**
- * Implementación del solver MWIS (esqueleto funcional).
- * Enfocado en equivalencia con Python y en estructuras listas para optimización.
- */
-
-#include "ce/solver.hpp"
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
+#include <fstream>
+#include <iostream>
 #include <numeric>
-#include <queue>
+#include <random>
 #include <set>
+#include <string>
+#include <vector>
 
-namespace ce {
+using i64 = long long;
 
-namespace {
-// Bitsets de n bits en palabras de 64, para probar compatibilidad
-// (vértice sin vecinos en un conjunto) con un AND por palabra en vez de
-// recorrer la lista de adyacencia (grado ~80 en n=400, dens 0.2).
-// El test es exactamente equivalente al recorrido: (adj[u] & S) == 0.
-// No cambia ninguna decisión, solo el costo.
-using Bits = std::vector<uint64_t>;
-inline size_t nwords(int n) { return static_cast<size_t>((n + 63) / 64); }
-inline void bit_set(Bits& b, int v) { b[static_cast<size_t>(v >> 6)] |= (1ULL << (v & 63)); }
-inline void bit_clear(Bits& b, int v) { b[static_cast<size_t>(v >> 6)] &= ~(1ULL << (v & 63)); }
-inline bool bit_test(const Bits& b, int v) {
-    return (b[static_cast<size_t>(v >> 6)] >> (v & 63)) & 1ULL;
-}
-inline bool bits_disjoint(const Bits& a, const Bits& b) {
-    for (size_t i = 0; i < a.size(); ++i)
-        if (a[i] & b[i]) return false;
+struct Graph {
+    int n = 0;
+    std::vector<std::vector<int>> adj;  // listas ordenadas
+    std::vector<std::vector<char>> mat; // matriz de adyacencia (membresía O(1))
+    std::vector<i64> w;                 // pesos en micro-unidades
+};
+
+static bool is_independent(const Graph& g, const std::set<int>& s) {
+    for (int u : s) {
+        for (int v : g.adj[u]) {
+            if (s.count(v)) return false;
+        }
+    }
     return true;
 }
-inline std::vector<Bits> build_adj_bits(const Graph& g) {
-    std::vector<Bits> ab(static_cast<size_t>(g.n), Bits(nwords(g.n), 0));
-    for (int u = 0; u < g.n; ++u)
-        for (int v : g.adj[u]) bit_set(ab[u], v);
-    return ab;
-}
-}  // namespace
 
-template <typename Evaluator>
-const std::vector<std::vector<uint64_t>>&
-MWISSolver<Evaluator>::adjacency_bits(const Graph& g) const
-{
-    if (cached_graph_ != &g) {
-        adj_bits_cache_ = build_adj_bits(g);
-        cached_graph_ = &g;
+static i64 objective(const std::vector<i64>& w, const std::set<int>& s) {
+    i64 t = 0;
+    for (int v : s) t += w[v];
+    return t;
+}
+
+// Desempate determinista: peso -> cardinalidad -> orden lexicográfico.
+static bool better_solution(i64 wa, const std::set<int>& A, i64 wb,
+                            const std::set<int>& B) {
+    if (wa != wb) return wa > wb;
+    if (A.size() != B.size()) return A.size() > B.size();
+    auto ia = A.begin(), ib = B.begin();
+    for (; ia != A.end(); ++ia, ++ib) {
+        if (*ia != *ib) return *ia < *ib;
     }
-    return adj_bits_cache_;
+    return false;
 }
 
-template <typename Evaluator>
-typename Evaluator::weight_t
-MWISSolver<Evaluator>::eval_weight(
-    const std::vector<int>& selected,
-    const std::vector<typename Evaluator::weight_t>& w) const
-{
-    auto acc = ev_.zero();
-    for (int v : selected) acc = ev_.add(acc, w[v]);
-    return acc;
-}
+struct Rng {
+    std::mt19937 e;
+    explicit Rng(unsigned seed) : e(seed) {}
+    double uniform01() {
+        std::uniform_real_distribution<double> d(0.0, 1.0);
+        return d(e);
+    }
+    double uniform(double a, double b) { return a + (b - a) * uniform01(); }
+    int uniform_int(int lo, int hi) {
+        std::uniform_int_distribution<int> d(lo, hi);
+        return d(e);
+    }
+};
 
-// Greedy por escaneo. El modo de jitter es parámetro de plantilla para que
-// el camino por defecto (por paso) no pague ninguna rama en tiempo de
-// ejecución por el experimento v5: `if constexpr` elimina la rama al compilar.
-//
-// v5: jitter por vértice. Con el jitter por paso original se sorteaba un
-// factor nuevo por candidato y por paso; con jitter por vértice se sortea uno
-// por vértice al empezar la construcción y queda fijo. Misma distribución,
-// sorteos distintos: el camino de búsqueda cambia y la calidad se re-mide
-// (hipótesis que dejó v4: la ganancia de calidad del heap en n grande venía
-// del jitter, no del heap).
-template <typename Evaluator>
-std::vector<int>
-MWISSolver<Evaluator>::greedy_construct(
-    const Graph& g,
-    const std::vector<typename Evaluator::weight_t>& w,
-    std::mt19937& rng,
-    double jitter) const
-{
-    const int n = g.n;
-    std::vector<char> blocked(n, 0);
-    std::vector<int> selected;
-    selected.reserve(n);
+struct AdjustedSolver {
+    int seed = 42;
+    int n_restarts = 8;
+    int n_perturbations = 10;
+    double drop_fraction = 0.25;
+    double cooling = 0.85;
+    int max_local_passes = 40;
+    bool enable_one_to_two = true;
+    double greedy_alpha = 0.50;
+    double greedy_beta = 0.50;
+    int max_12_candidates = 80;
+    double initial_acceptance_p = 0.50;
+    double temp_scale = 0.25;
+    int early_stop_restarts = 6;
 
-    std::vector<int> residual(n);
-    for (int i = 0; i < n; ++i) residual[i] = g.degree(i);
+    std::pair<std::vector<int>, i64> solve(const Graph& g) {
+        const auto& weights = g.w;
+        Rng rng((unsigned)seed);
 
-    int remaining = n;
-    const auto zero = ev_.zero();
-    // Un vértice con peso negativo nunca forma parte de un MWIS óptimo.
-    // Los pesos cero se conservan por el desempate de mayor cardinalidad.
-    for (int v = 0; v < n; ++v) {
-        if (ev_.compare(w[v], zero) < 0) {
-            blocked[v] = 1;
-            --remaining;
+        std::set<int> best_set;
+        i64 best_w = 0;
+
+        std::vector<i64> positive;
+        for (i64 w : weights) if (w > 0) positive.push_back(w);
+        double mean_w = 1.0;
+        if (!positive.empty()) {
+            double s = 0.0;
+            for (i64 w : positive) s += (double)w;
+            mean_w = std::max(1.0, s / (double)positive.size());
         }
-    }
-    for (int v = 0; v < n; ++v) {
-        if (blocked[v]) {
-            for (int u : g.adj[v])
-                if (!blocked[u]) --residual[u];
+        double median = 1.0;
+        if (!positive.empty()) {
+            std::vector<i64> sp = positive;
+            std::sort(sp.begin(), sp.end());
+            size_t m = sp.size();
+            median = (m % 2 == 1) ? (double)sp[m / 2]
+                                  : ((double)sp[m / 2 - 1] + (double)sp[m / 2]) / 2.0;
         }
-    }
-    while (remaining > 0) {
-        int best_u = -1;
-        typename Evaluator::weight_t best_w = ev_.zero();
-        int best_denom = 1;
+        double delta_typical = median * temp_scale;
+        double temp0 = -delta_typical / std::log(initial_acceptance_p);
 
-        for (int u = 0; u < n; ++u) {
-            if (blocked[u]) continue;
-            int denom = residual[u] + 1;
-            auto wu = w[u];
-            if (jitter > 0.0) {
-                std::uniform_real_distribution<double> dist(-jitter, jitter);
-                double factor = 1.0 + dist(rng);
-                double noisy = std::max(0.0, ev_.to_float(w[u]) * factor);
-                wu = ev_.from_weight(noisy);
+        int restarts_without_gain = 0;
+        for (int restart = 0; restart < n_restarts; ++restart) {
+            double jitter = (restart == 0) ? 0.0 : std::min(0.35, 0.05 * restart);
+            std::set<int> sol = greedy_fill(g, std::set<int>(), rng, mean_w, jitter);
+            auto pr = local_improve_fast(g, sol);
+            std::set<int> cur = pr.first;
+            i64 cur_w = pr.second;
+
+            bool improved_this_restart = false;
+            if (better_solution(cur_w, cur, best_w, best_set)) {
+                best_set = cur; best_w = cur_w;
+                improved_this_restart = true;
             }
-            if (best_u < 0) {
-                best_u = u;
-                best_w = wu;
-                best_denom = denom;
-            } else {
-                int cmp = ev_.compare_ratios(wu, denom, best_w, best_denom);
-                if (cmp > 0 || (cmp == 0 && (rng() & 1))) {
-                    best_u = u;
-                    best_w = wu;
-                    best_denom = denom;
+
+            double temp = temp0;
+            for (int k = 0; k < n_perturbations; ++k) {
+                auto cp = perturb_repair_fast(g, cur, rng, mean_w);
+                std::set<int> cand = cp.first;
+                i64 cand_w = cp.second;
+                if (better_solution(cand_w, cand, best_w, best_set)) {
+                    best_set = cand; best_w = cand_w;
+                    improved_this_restart = true;
+                }
+                double delta = (double)(cand_w - cur_w);
+                if (delta >= 0.0 || (temp > 1e-12 && rng.uniform01() < std::exp(delta / temp))) {
+                    cur = cand; cur_w = cand_w;
+                }
+                temp *= cooling;
+            }
+
+            auto rf = local_improve_full(g, cur);
+            if (better_solution(rf.second, rf.first, best_w, best_set)) {
+                best_set = rf.first; best_w = rf.second;
+                improved_this_restart = true;
+            }
+
+            if (improved_this_restart) {
+                restarts_without_gain = 0;
+            } else if (early_stop_restarts > 0) {
+                if (++restarts_without_gain >= early_stop_restarts) break;
+            }
+        }
+
+        auto fr = local_improve_full(g, best_set);
+        if (better_solution(fr.second, fr.first, best_w, best_set)) {
+            best_set = fr.first; best_w = fr.second;
+        }
+        if (!is_independent(g, best_set)) {
+            throw std::runtime_error("AdjustedSolver devolvió una solución no independiente");
+        }
+        std::vector<int> ordered(best_set.begin(), best_set.end());
+        return {ordered, best_w};
+    }
+
+    std::set<int> greedy_fill(const Graph& g, const std::set<int>& initial,
+                              Rng& rng, double mean_w, double jitter) {
+        const auto& adj = g.adj;
+        const auto& weights = g.w;
+        const int n = g.n;
+        std::set<int> selected = initial;
+        std::set<int> blocked = selected;
+        for (int u : selected) for (int v : adj[u]) blocked.insert(v);
+
+        std::set<int> candidates;
+        for (int u = 0; u < n; ++u)
+            if (!blocked.count(u) && weights[u] >= 0) candidates.insert(u);
+
+        std::vector<int> residual_degree(n, 0);
+        std::vector<i64> residual_neighbor_weight(n, 0);
+        for (int u = 0; u < n; ++u) {
+            for (int v : adj[u]) {
+                if (candidates.count(v)) {
+                    residual_degree[u] += 1;
+                    residual_neighbor_weight[u] += weights[v];
                 }
             }
         }
-        if (best_u < 0) break;
 
-        selected.push_back(best_u);
-        blocked[best_u] = 1;
-        --remaining;
-        for (int v : g.adj[best_u]) {
-            if (!blocked[v]) {
-                blocked[v] = 1;
-                --remaining;
-                for (int x : g.adj[v])
-                    if (!blocked[x]) --residual[x];
+        while (!candidates.empty()) {
+            int best_u = -1;
+            double best_score = -1e300;
+            for (int u : candidates) {
+                double denom = 1.0 + greedy_alpha * residual_degree[u]
+                             + greedy_beta * (double)residual_neighbor_weight[u] / mean_w;
+                double score = (double)weights[u] / denom;
+                if (jitter > 0.0) score *= 1.0 + rng.uniform(-jitter, jitter);
+                if (score > best_score || (score == best_score && rng.uniform01() < 0.5)) {
+                    best_u = u; best_score = score;
+                }
+            }
+            if (best_u < 0) throw std::runtime_error("Greedy ajustado sin candidato");
+
+            selected.insert(best_u);
+            std::set<int> removed;
+            removed.insert(best_u);
+            for (int v : adj[best_u]) if (candidates.count(v)) removed.insert(v);
+            for (int x : removed) candidates.erase(x);
+
+            for (int x : removed) {
+                i64 wx = weights[x];
+                for (int y : adj[x]) {
+                    if (candidates.count(y)) {
+                        residual_degree[y] -= 1;
+                        residual_neighbor_weight[y] -= wx;
+                    }
+                }
             }
         }
-        for (int x : g.adj[best_u])
-            if (!blocked[x]) --residual[x];
+        return selected;
     }
-    std::sort(selected.begin(), selected.end());
-    return selected;
-}
 
+    static std::vector<int> build_conflict_counts(const Graph& g,
+                                                  const std::set<int>& cur) {
+        std::vector<int> counts(g.n, 0);
+        for (int u : cur) for (int v : g.adj[u]) counts[v] += 1;
+        return counts;
+    }
 
-template <typename Evaluator>
-std::vector<int>
-MWISSolver<Evaluator>::local_improve(
-    const Graph& g,
-    const std::vector<typename Evaluator::weight_t>& w,
-    std::vector<int> selected) const
-{
-    const int n = g.n;
-    std::vector<char> in(n, 0);
-    for (int v : selected) in[v] = 1;
-    auto cur_w = eval_weight(selected, w);
-    const auto zero = ev_.zero();
-    // Bitsets: adjBits[u] = vecinos de u; curBits = vértices en `selected`.
-    // Se mantienen sincronizados con `in` en cada cambio.
-    const auto& adjBits = adjacency_bits(g);
-    Bits curBits(nwords(n), 0);
-    for (int v : selected) bit_set(curBits, v);
+    static i64 insert_vertex(const Graph& g, int v, std::set<int>& cur, i64 cur_w,
+                             std::vector<int>& counts) {
+        cur.insert(v);
+        for (int u : g.adj[v]) counts[u] += 1;
+        return cur_w + g.w[v];
+    }
 
-    for (int pass = 0; pass < cfg_.max_local_passes; ++pass) {
-        bool improved = false;
+    static i64 remove_vertex(const Graph& g, int v, std::set<int>& cur, i64 cur_w,
+                             std::vector<int>& counts) {
+        cur.erase(v);
+        for (int u : g.adj[v]) counts[u] -= 1;
+        return cur_w - g.w[v];
+    }
 
-        // 1. Adición (mismo orden: primer v factible en orden ascendente)
-        Bits blockedBits = curBits;
-        for (int v : selected)
-            for (size_t k = 0; k < blockedBits.size(); ++k) blockedBits[k] |= adjBits[static_cast<size_t>(v)][k];
-        for (int v = 0; v < n; ++v) {
-            if (!bit_test(blockedBits, v) && ev_.compare(w[v], zero) >= 0) {
-                selected.push_back(v);
-                in[v] = 1;
-                bit_set(curBits, v);
-                cur_w = ev_.add(cur_w, w[v]);
-                improved = true;
-                break;
-            }
-        }
-        if (improved) {
-            std::sort(selected.begin(), selected.end());
-            continue;
-        }
-
-        // 2. Intercambio 1-1 (first improvement)
-        for (size_t i = 0; i < selected.size() && !improved; ++i) {
-            int v = selected[i];
-            // construir others
-            Bits othersBits = curBits;
-            bit_clear(othersBits, v);
-            // base = peso de los demás = cur_w - w[v] (exacto en racional;
-            // en float cambia el orden de redondeo en el último bit, sin
-            // cambiar el algoritmo). O(1) sumas en vez de O(k) por cada v.
-            auto base = ev_.add(cur_w, ev_.mul_int(w[v], -1));
-
-            for (int u = 0; u < n; ++u) {
-                if (in[u]) continue;
-                if (ev_.compare(w[u], zero) < 0) continue;
-                if (!bits_disjoint(adjBits[static_cast<size_t>(u)], othersBits)) continue;
-                auto cand_w = ev_.add(base, w[u]);
-                std::vector<int> candidate = selected;
-                candidate[i] = u;
-                std::sort(candidate.begin(), candidate.end());
-                if (is_better_solution(ev_, cand_w, candidate, cur_w, selected)) {
-                    selected = candidate;
-                    in[v] = 0; in[u] = 1;
-                    bit_clear(curBits, v); bit_set(curBits, u);
-                    cur_w = cand_w;
+    // Adición + 1-1 (rápido, con conteos).
+    std::pair<std::set<int>, i64> add_and_one_to_one(const Graph& g,
+                                                     std::set<int> cur, i64 cur_w,
+                                                     std::vector<int>& counts) {
+        const auto& adj = g.adj;
+        const auto& weights = g.w;
+        const int n = g.n;
+        while (true) {
+            bool improved = false;
+            for (int v = 0; v < n; ++v) {
+                if (!cur.count(v) && counts[v] == 0 && weights[v] >= 0) {
+                    cur_w = insert_vertex(g, v, cur, cur_w, counts);
                     improved = true;
                     break;
                 }
             }
-        }
-        if (improved) {
-            std::sort(selected.begin(), selected.end());
-            continue;
-        }
+            if (improved) continue;
 
-        // 3. Intercambio 2-1 (port fiel de Python: _local_improve paso 3).
-        //    Quita dos vértices y mete uno compatible con el resto, si pesa más.
-        //    First improvement, como en Python; solo se alcanza si 1-1 no mejoró.
-        if (selected.size() >= 2) {
-            for (size_t i = 0; i < selected.size() && !improved; ++i) {
-                for (size_t j = i + 1; j < selected.size() && !improved; ++j) {
-                    int a = selected[i], b = selected[j];
-                    Bits othersBits = curBits;
-                    bit_clear(othersBits, a);
-                    bit_clear(othersBits, b);
-                    // base = cur_w - w[a] - w[b], precalculada fuera del
-                    // bucle sobre u: O(1) sumas por par en vez de O(k).
-                    auto base = ev_.add(ev_.add(cur_w, ev_.mul_int(w[a], -1)),
-                                        ev_.mul_int(w[b], -1));
-                    for (int u = 0; u < n; ++u) {
-                        if (in[u]) continue;
-                        if (ev_.compare(w[u], zero) < 0) continue;
-                        if (!bits_disjoint(adjBits[static_cast<size_t>(u)], othersBits)) continue;
-                        auto cand_w = ev_.add(base, w[u]);
-                        std::vector<int> next;
-                        next.reserve(selected.size() - 1);
-                        for (int x : selected) if (x != a && x != b) next.push_back(x);
-                        next.push_back(u);
-                        std::sort(next.begin(), next.end());
-                        if (is_better_solution(ev_, cand_w, next, cur_w, selected)) {
-                            selected = next;
-                            in[a] = 0; in[b] = 0; in[u] = 1;
-                            bit_clear(curBits, a); bit_clear(curBits, b); bit_set(curBits, u);
-                            cur_w = cand_w;
-                            improved = true;
-                            break;
-                        }
+            for (int v : cur) {
+                i64 wv = weights[v];
+                bool done = false;
+                for (int u : adj[v]) {
+                    if (cur.count(u) || counts[u] != 1) continue;
+                    i64 wu = weights[u];
+                    if (wu > wv || (wu == wv && u < v)) {
+                        cur_w = remove_vertex(g, v, cur, cur_w, counts);
+                        cur_w = insert_vertex(g, u, cur, cur_w, counts);
+                        improved = true; done = true;
+                        break;
+                    }
+                }
+                if (done) break;
+            }
+            if (!improved) return {cur, cur_w};
+        }
+    }
+
+    std::pair<std::set<int>, i64> local_improve_fast(const Graph& g,
+                                                     const std::set<int>& selected) {
+        std::set<int> cur = selected;
+        i64 cur_w = objective(g.w, cur);
+        std::vector<int> counts = build_conflict_counts(g, cur);
+        return add_and_one_to_one(g, cur, cur_w, counts);
+    }
+
+    std::pair<std::set<int>, i64> local_improve_full(const Graph& g,
+                                                     const std::set<int>& selected) {
+        const auto& adj = g.adj;
+        const auto& weights = g.w;
+        const int n = g.n;
+        std::set<int> cur = selected;
+        i64 cur_w = objective(g.w, cur);
+        std::vector<int> counts = build_conflict_counts(g, cur);
+
+        for (int pass = 0; pass < max_local_passes; ++pass) {
+            auto a = add_and_one_to_one(g, cur, cur_w, counts);
+            cur = a.first; cur_w = a.second;
+            bool improved = false;
+
+            // 2-1 guiado por conflict_count == 2
+            if (cur.size() >= 2) {
+                std::vector<int> cand21;
+                for (int u = 0; u < n; ++u)
+                    if (!cur.count(u) && counts[u] == 2 && weights[u] > 0) cand21.push_back(u);
+                std::stable_sort(cand21.begin(), cand21.end(),
+                                 [&](int a, int b) { return weights[a] > weights[b]; });
+                for (int u : cand21) {
+                    std::vector<int> pair;
+                    for (int v : adj[u]) if (cur.count(v)) pair.push_back(v);
+                    if (pair.size() != 2) continue;
+                    int av = pair[0], bv = pair[1];
+                    if (weights[u] > weights[av] + weights[bv]) {
+                        cur_w = remove_vertex(g, av, cur, cur_w, counts);
+                        cur_w = remove_vertex(g, bv, cur, cur_w, counts);
+                        cur_w = insert_vertex(g, u, cur, cur_w, counts);
+                        improved = true;
+                        break;
                     }
                 }
             }
-        }
-        if (improved) {
-            std::sort(selected.begin(), selected.end());
-            continue;
-        }
+            if (improved) continue;
 
-        // 4. Intercambio 1-2 (port fiel de Python: _local_improve paso 4).
-        //    Quita un vértice y mete dos compatibles entre sí y con el resto.
-        if (cfg_.enable_one_to_two && !selected.empty()) {
-            for (size_t i = 0; i < selected.size() && !improved; ++i) {
-                int v = selected[i];
-                Bits othersBits = curBits;
-                bit_clear(othersBits, v);
-                // base = cur_w - w[v], precalculada fuera del bucle sobre
-                // los pares (u, x): O(1) sumas por v en vez de O(k).
-                auto base = ev_.add(cur_w, ev_.mul_int(w[v], -1));
-                std::vector<int> compat;
-                for (int u = 0; u < n; ++u) {
-                    if (in[u]) continue;
-                    if (ev_.compare(w[u], zero) >= 0 &&
-                        bits_disjoint(adjBits[static_cast<size_t>(u)], othersBits)) compat.push_back(u);
-                }
-                for (size_t p = 0; p < compat.size() && !improved; ++p) {
-                    for (size_t q = p + 1; q < compat.size() && !improved; ++q) {
-                        int u = compat[p], x = compat[q];
-                        if (bit_test(adjBits[static_cast<size_t>(u)], x)) continue;
-                        auto pair_w = ev_.add(w[u], w[x]);
-                        auto cand_w = ev_.add(base, pair_w);
-                        std::vector<int> next;
-                        next.reserve(selected.size() + 1);
-                        for (int y : selected) if (y != v) next.push_back(y);
-                        next.push_back(u);
-                        next.push_back(x);
-                        std::sort(next.begin(), next.end());
-                        if (is_better_solution(ev_, cand_w, next, cur_w, selected)) {
-                            selected = next;
-                            in[v] = 0; in[u] = 1; in[x] = 1;
-                            bit_clear(curBits, v); bit_set(curBits, u); bit_set(curBits, x);
-                            cur_w = cand_w;
-                            improved = true;
-                            break;
+            // 1-2: u, x entran al sacar v; ambos con conflict_count == 1
+            if (enable_one_to_two && !cur.empty()) {
+                for (int v : cur) {
+                    i64 wv = weights[v];
+                    std::vector<int> compat;
+                    for (int u : adj[v])
+                        if (!cur.count(u) && counts[u] == 1 && weights[u] >= 0) compat.push_back(u);
+                    if (compat.size() < 2) continue;
+                    std::stable_sort(compat.begin(), compat.end(),
+                                     [&](int a, int b) { return weights[a] > weights[b]; });
+                    i64 max_partner = weights[compat[0]];
+                    std::vector<int> filt;
+                    for (int u : compat)
+                        if (weights[u] + max_partner >= wv) filt.push_back(u);
+                    compat.swap(filt);
+                    if (max_12_candidates >= 0 && (int)compat.size() > max_12_candidates)
+                        compat.resize((size_t)max_12_candidates);
+
+                    int L = (int)compat.size();
+                    for (int i = 0; i + 1 < L; ++i) {
+                        int u = compat[i];
+                        if (weights[u] + weights[compat[i + 1]] < wv) break;
+                        for (int j = i + 1; j < L; ++j) {
+                            int x = compat[j];
+                            if (weights[u] + weights[x] < wv) break;
+                            if (!g.mat[u][x]) {
+                                cur_w = remove_vertex(g, v, cur, cur_w, counts);
+                                cur_w = insert_vertex(g, u, cur, cur_w, counts);
+                                cur_w = insert_vertex(g, x, cur, cur_w, counts);
+                                improved = true;
+                                break;
+                            }
                         }
+                        if (improved) break;
                     }
+                    if (improved) break;
                 }
             }
+            if (!improved) break;
         }
-        if (!improved) break;
-    }
-    std::sort(selected.begin(), selected.end());
-    return selected;
-}
-
-template <typename Evaluator>
-std::vector<int>
-MWISSolver<Evaluator>::perturb_and_repair(
-    const Graph& g,
-    const std::vector<typename Evaluator::weight_t>& w,
-    const std::vector<int>& selected,
-    std::mt19937& rng) const
-{
-    if (selected.empty())
-        return greedy_construct(g, w, rng, 0.15);
-
-    int k_drop = std::max(1, static_cast<int>(std::round(selected.size() * cfg_.drop_fraction)));
-    k_drop = std::min(k_drop, static_cast<int>(selected.size()));
-
-    std::vector<int> idx(selected.size());
-    std::iota(idx.begin(), idx.end(), 0);
-    std::shuffle(idx.begin(), idx.end(), rng);
-
-    std::vector<char> drop(selected.size(), 0);
-    for (int i = 0; i < k_drop; ++i) drop[idx[i]] = 1;
-
-    std::vector<int> cur;
-    std::vector<char> blocked(g.n, 0);
-    for (size_t i = 0; i < selected.size(); ++i) {
-        if (!drop[i]) {
-            cur.push_back(selected[i]);
-            blocked[selected[i]] = 1;
-            for (int u : g.adj[selected[i]]) blocked[u] = 1;
-        }
+        return {cur, cur_w};
     }
 
-    std::vector<int> remaining;
-    for (int v = 0; v < g.n; ++v) if (!blocked[v]) remaining.push_back(v);
-    std::shuffle(remaining.begin(), remaining.end(), rng);
-    // Reparación: añade vértices en el orden barajado si son compatibles
-    // con el `cur` actual. Antes esto reconstruía un vector in_cur de
-    // tamaño n por cada vértice (O(n²)) y tenía un bucle muerto con
-    // std::find; ahora es un bitset incremental O(1) por vértice.
-    // Mismas decisiones, mismo orden: solo cambia el costo.
-    const auto& adjBits = adjacency_bits(g);
-    Bits curBits(nwords(g.n), 0);
-    for (int x : cur) bit_set(curBits, x);
-    for (int v : remaining) {
-        if (ev_.compare(w[v], ev_.zero()) >= 0 &&
-            bits_disjoint(adjBits[static_cast<size_t>(v)], curBits)) {
-            cur.push_back(v);
-            bit_set(curBits, v);
+    // Continuación: desde el mejor actual, SOLO repite el bucle de
+    // perturbación + recocido con una semilla nueva (sin reconstruir
+    // greedy desde cero ni repetir los restarts). La temperatura se
+    // reinicia cada n_perturbations rondas, como en un restart.
+    // Devuelve el mejor actualizado.
+    std::pair<std::set<int>, i64> continue_search(const Graph& g,
+                                                  std::set<int> best_set, i64 best_w,
+                                                  unsigned seed, int rounds) {
+        const auto& weights = g.w;
+        Rng rng(seed);
+        std::vector<i64> positive;
+        for (i64 w : weights) if (w > 0) positive.push_back(w);
+        double mean_w = 1.0;
+        if (!positive.empty()) {
+            double s = 0.0;
+            for (i64 w : positive) s += (double)w;
+            mean_w = std::max(1.0, s / (double)positive.size());
         }
-    }
-    return local_improve(g, w, cur);
-}
-
-template <typename Evaluator>
-Solution<Evaluator>
-MWISSolver<Evaluator>::solve(const Graph& g)
-{
-    cached_graph_ = nullptr; // refrescar incluso si el llamador mutó el mismo objeto
-    adj_bits_cache_.clear();
-    (void)adjacency_bits(g); // construir una sola vez durante esta resolución
-    std::vector<typename Evaluator::weight_t> w(g.n);
-    for (int i = 0; i < g.n; ++i) w[i] = ev_.from_weight(g.weights[i]);
-
-    std::mt19937 rng(cfg_.seed);
-
-    Solution<Evaluator> best;
-    best.weight = ev_.zero();
-    best.vertices.clear();
-
-    for (int r = 0; r < cfg_.n_restarts; ++r) {
-        double jitter = (r == 0) ? 0.0 : std::min(0.35, 0.05 * r);
-        auto sol = greedy_construct(g, w, rng, jitter);
-        sol = local_improve(g, w, sol);
-        auto wt = eval_weight(sol, w);
-
-        if (is_better_solution(ev_, wt, sol, best.weight, best.vertices)) {
-            best.vertices = sol;
-            best.weight = wt;
+        double median = 1.0;
+        if (!positive.empty()) {
+            std::vector<i64> sp = positive;
+            std::sort(sp.begin(), sp.end());
+            size_t m = sp.size();
+            median = (m % 2 == 1) ? (double)sp[m / 2]
+                                  : ((double)sp[m / 2 - 1] + (double)sp[m / 2]) / 2.0;
         }
-
-        // perturbaciones
-        auto cur = sol;
-        auto cur_w = wt;
-        double temp = cfg_.initial_temp;
-        for (int p = 0; p < cfg_.n_perturbations; ++p) {
-            auto cand = perturb_and_repair(g, w, cur, rng);
-            auto cand_w = eval_weight(cand, w);
-            if (is_better_solution(ev_, cand_w, cand, best.weight, best.vertices)) {
-                best.vertices = cand;
-                best.weight = cand_w;
+        double temp0 = -median * temp_scale / std::log(initial_acceptance_p);
+        double temp = temp0;
+        std::set<int> cur = best_set;
+        i64 cur_w = best_w;
+        for (int k = 0; k < rounds; ++k) {
+            if (k % n_perturbations == 0) temp = temp0;
+            auto cp = perturb_repair_fast(g, cur, rng, mean_w);
+            std::set<int> cand = cp.first;
+            i64 cand_w = cp.second;
+            if (better_solution(cand_w, cand, best_w, best_set)) {
+                best_set = cand; best_w = cand_w;
             }
-            const auto delta_w = ev_.add(cand_w, ev_.mul_int(cur_w, -1));
-            double delta = ev_.to_float(delta_w);
-            if (delta >= 0.0 || (temp > 1e-9 &&
-                std::generate_canonical<double, 53>(rng) < std::exp(delta / std::max(temp, 1e-12)))) {
-                cur = cand;
-                cur_w = cand_w;
+            double delta = (double)(cand_w - cur_w);
+            if (delta >= 0.0 || (temp > 1e-12 && rng.uniform01() < std::exp(delta / temp))) {
+                cur = cand; cur_w = cand_w;
             }
-            temp *= cfg_.cooling;
+            temp *= cooling;
         }
+        auto rf = local_improve_full(g, cur);
+        if (better_solution(rf.second, rf.first, best_w, best_set)) {
+            best_set = rf.first; best_w = rf.second;
+        }
+        return {best_set, best_w};
     }
-    best.sort_vertices();
-    return best;
+
+    std::pair<std::set<int>, i64> perturb_repair_fast(const Graph& g,
+                                                      const std::set<int>& selected,
+                                                      Rng& rng, double mean_w) {
+        if (selected.empty()) {
+            std::set<int> filled = greedy_fill(g, std::set<int>(), rng, mean_w, 0.15);
+            return local_improve_fast(g, filled);
+        }
+        int k_drop = std::max(1, (int)std::lround((double)selected.size() * drop_fraction));
+        k_drop = std::min(k_drop, (int)selected.size());
+        std::vector<int> sorted_sel(selected.begin(), selected.end());
+        for (int i = 0; i < k_drop; ++i) {
+            int j = rng.uniform_int(i, (int)sorted_sel.size() - 1);
+            std::swap(sorted_sel[i], sorted_sel[j]);
+        }
+        std::set<int> partial;
+        for (size_t i = (size_t)k_drop; i < sorted_sel.size(); ++i) partial.insert(sorted_sel[i]);
+        std::set<int> repaired = greedy_fill(g, partial, rng, mean_w, 0.10);
+        return local_improve_fast(g, repaired);
+    }
+};
+
+int main(int argc, char** argv) {
+    std::string input;
+    AdjustedSolver solver;
+    int reps = 1;
+    int seed_base = 42;
+    int cont_rounds = 20;
+    std::string mode = "multi";  // multi: solves completos (el mejor medido).
+                                 // cont: 1 solve + continuaciones (experimento:
+                                 // no recuperó las ganancias del multi).
+    for (int i = 1; i < argc; ++i) {
+        std::string a = argv[i];
+        auto need = [&](int& j) {
+            if (j + 1 >= argc) { std::cerr << "falta valor para " << a << "\n"; return false; }
+            return true;
+        };
+        if (a == "--seed") { if (!need(i)) return 2; solver.seed = std::atoi(argv[++i]); seed_base = solver.seed; }
+        else if (a == "--seed-base") { if (!need(i)) return 2; seed_base = std::atoi(argv[++i]); }
+        else if (a == "--reps") { if (!need(i)) return 2; reps = std::atoi(argv[++i]); }
+        else if (a == "--cont-rounds") { if (!need(i)) return 2; cont_rounds = std::atoi(argv[++i]); }
+        else if (a == "--mode") { if (!need(i)) return 2; mode = argv[++i]; }
+        else if (a == "--restarts") { if (!need(i)) return 2; solver.n_restarts = std::atoi(argv[++i]); }
+        else if (a == "--perturbations") { if (!need(i)) return 2; solver.n_perturbations = std::atoi(argv[++i]); }
+        else if (a == "--early-stop") { if (!need(i)) return 2; solver.early_stop_restarts = std::atoi(argv[++i]); }
+        else if (a == "--one-to-two") { if (!need(i)) return 2; solver.enable_one_to_two = std::atoi(argv[++i]) != 0; }
+        else if (!a.empty() && a[0] != '-') input = a;
+        else { std::cerr << "argumento desconocido: " << a << "\n"; return 2; }
+    }
+    if (input.empty()) { std::cerr << "uso: refactor_v1 <instancia.txt> [--seed N]\n"; return 2; }
+
+    std::ifstream in(input);
+    if (!in) { std::cerr << "no puedo abrir " << input << "\n"; return 2; }
+    int n, m;
+    if (!(in >> n >> m)) { std::cerr << "formato inválido\n"; return 2; }
+    Graph g;
+    g.n = n;
+    g.adj.assign(n, {});
+    g.mat.assign(n, std::vector<char>(n, 0));
+    g.w.assign(n, 0);
+    for (int k = 0; k < m; ++k) {
+        int u, v;
+        in >> u >> v;
+        g.adj[u].push_back(v);
+        g.adj[v].push_back(u);
+        g.mat[u][v] = g.mat[v][u] = 1;
+    }
+    for (int i = 0; i < n; ++i) {
+        std::sort(g.adj[i].begin(), g.adj[i].end());
+        g.adj[i].erase(std::unique(g.adj[i].begin(), g.adj[i].end()), g.adj[i].end());
+    }
+    for (int i = 0; i < n; ++i) {
+        i64 w;
+        in >> w;
+        g.w[i] = w;
+    }
+
+    // Modo multi (por defecto, el mejor medido): reps solves completos
+    // con semillas base, base+1, ...; cada uno validado exacto y se
+    // queda el mejor. Modo cont: 1 solve + continuaciones (solo el
+    // bucle de perturbación desde el mejor); medido peor que multi.
+    i64 best_score = -1;
+    std::vector<int> best_verts;
+    double total_dt = 0.0;
+    if (mode == "multi") {
+        for (int rep = 0; rep < reps; ++rep) {
+            solver.seed = seed_base + rep;
+            auto t0 = std::chrono::steady_clock::now();
+            auto res = solver.solve(g);
+            auto t1 = std::chrono::steady_clock::now();
+            total_dt += std::chrono::duration<double>(t1 - t0).count();
+            std::set<int> vs(res.first.begin(), res.first.end());
+            i64 check_w = 0;
+            for (int v : vs) check_w += g.w[v];
+            if (check_w != res.second || !is_independent(g, vs)) {
+                std::cerr << "rep " << rep << " inválida, se descarta\n";
+                continue;
+            }
+            std::set<int> best_set(best_verts.begin(), best_verts.end());
+            if (best_score < 0 || better_solution(res.second, vs, best_score, best_set)) {
+                best_score = res.second;
+                best_verts = res.first;
+            }
+        }
+    } else if (mode == "cont") {
+        // Rep 0: solve completo. Reps siguientes: SOLO la continuación
+        // (bucle de perturbación + recocido) desde el mejor actual.
+        {
+            solver.seed = seed_base;
+            auto t0 = std::chrono::steady_clock::now();
+            auto res = solver.solve(g);
+            auto t1 = std::chrono::steady_clock::now();
+            total_dt += std::chrono::duration<double>(t1 - t0).count();
+            std::set<int> vs(res.first.begin(), res.first.end());
+            i64 check_w = 0;
+            for (int v : vs) check_w += g.w[v];
+            if (check_w != res.second || !is_independent(g, vs)) {
+                std::cerr << "solve inicial inválido\n";
+                return 3;
+            }
+            best_score = res.second;
+            best_verts = res.first;
+        }
+        for (int rep = 1; rep < reps; ++rep) {
+            std::set<int> best_set(best_verts.begin(), best_verts.end());
+            auto t0 = std::chrono::steady_clock::now();
+            auto res = solver.continue_search(g, best_set, best_score,
+                                              (unsigned)(seed_base + rep), cont_rounds);
+            auto t1 = std::chrono::steady_clock::now();
+            total_dt += std::chrono::duration<double>(t1 - t0).count();
+            std::set<int> vs(res.first.begin(), res.first.end());
+            i64 check_w = 0;
+            for (int v : vs) check_w += g.w[v];
+            if (check_w != res.second || !is_independent(g, vs)) {
+                std::cerr << "continuación " << rep << " inválida, se descarta\n";
+                continue;
+            }
+            if (better_solution(res.second, vs, best_score, best_set)) {
+                best_score = res.second;
+                best_verts.assign(res.first.begin(), res.first.end());
+            }
+        }
+    } else {
+        std::cerr << "modo desconocido: " << mode << " (multi|cont)\n";
+        return 2;
+    }
+    if (best_score < 0) { std::cerr << "ninguna repetición válida\n"; return 3; }
+
+    std::cout << "weight " << best_score << "\n";
+    std::cout << "time_s " << total_dt << "\n";
+    std::cout << "reps " << reps << "\n";
+    std::cout << "vertices";
+    for (int v : best_verts) std::cout << " " << v;
+    std::cout << "\n";
+    return 0;
 }
-
-// Instanciaciones explícitas
-template class MWISSolver<FloatEvaluator>;
-template class MWISSolver<ExactEvaluator>;
-
-}  // namespace ce
