@@ -7,8 +7,8 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 
 # Núcleo: evaluador racional exacto (cpp_int). El solver es autocontenido
 # en src/solver.cpp (AdjustedSolver es6, con su propio main): el binario se
-# construye directamente de ese archivo. El main.cpp y solver.hpp del solver
-# viejo quedaron fuera del build (ver NOTA.md).
+# construye directamente de ese archivo. Los archivos del solver viejo
+# (main.cpp, solver.hpp, solution.hpp) ya se eliminaron del repo.
 add_library(ce_core
     src/evaluator.cpp
 )

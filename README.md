@@ -129,10 +129,12 @@ Python y C++ usan RNG distintos (`random` vs `mt19937`), así que los pesos pued
 ## Pruebas
 
 ```bash
-make test
+make -C cpp
+PYTHONPATH=src python -m pytest -q
+make -C cpp test
 ```
 
-Compila el backend C++, corre 18 pruebas Python (solver, cotas exactas y diferencial Python↔C++ sobre las mismas instancias) y las regresiones C++ del evaluador racional exacto (incluido el caso de 400 pesos sin desbordamiento). CI en GitHub Actions (`.github/workflows/tests.yml`).
+Compila el backend C++, corre 18 pruebas Python (solver, cotas exactas y diferencial Python↔C++ sobre las mismas instancias) y las regresiones C++ del evaluador racional exacto (incluido el caso de 400 pesos sin desbordamiento). El único Makefile del repo es `cpp/Makefile`; los notebooks y el CI usan `make -C cpp`. CI en GitHub Actions (`.github/workflows/tests.yml`).
 
 ## Estructura
 
