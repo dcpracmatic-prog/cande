@@ -1,0 +1,19 @@
+# Python
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+*.egg-info/
+build/
+dist/
+
+# C++
+*.o
+*.d
+cpp/ce_mwis
+cpp/test_exact
+
+# Generated benchmark output and instances
+benchmarks/
+bench_families_results.json
+bench_cpp_int_results.json
