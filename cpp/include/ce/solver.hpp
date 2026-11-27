@@ -1,9 +1,4 @@
 # pragma once
-/**
- * Esqueleto del solver MWIS en C++.
- * Mantiene el mismo contrato de configuración y la misma regla is_better_solution.
- */
-
 # include <random>
 # include <cstdint>
 # include <vector>
