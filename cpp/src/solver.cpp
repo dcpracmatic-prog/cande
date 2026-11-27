@@ -1,4 +1,4 @@
-// tunel_t2.cpp — Puerto C++17 del AdjustedSolver con tunelamiento adaptativo ×2.
+// solver.cpp — Puerto C++17 del AdjustedSolver con tunelamiento adaptativo ×2.
 //
 // Misma base que refactor_v1_es6.cpp (temp_scale 0.25, cooling 0.85,
 // 1-2 activado con tope 80, early-stop 6 restarts sin mejora, 8x10, seed 42)
@@ -20,7 +20,7 @@
 // luego n pesos en micro-unidades (pueden ir en varias líneas).
 // Salida stdout: líneas "weight <score>", "time_s <s>", "vertices <v ...>".
 //
-// Compilar: g++ -O3 -std=c++17 -o tunel_t2 tunel_t2.cpp
+// Compilar: g++ -O3 -std=c++17 -o ce_mwis solver.cpp
 
 #include <algorithm>
 #include <chrono>
@@ -542,7 +542,7 @@ int main(int argc, char** argv) {
         else if (!a.empty() && a[0] != '-') input = a;
         else { std::cerr << "argumento desconocido: " << a << "\n"; return 2; }
     }
-    if (input.empty()) { std::cerr << "uso: tunel_v1 <instancia.txt> [--seed N]\n"; return 2; }
+    if (input.empty()) { std::cerr << "uso: ce_mwis <instancia.txt> [--seed N] [--reps R] [--mode multi|cont] [--tunnel-mult N] [--max-time-s S]\n"; return 2; }
 
     std::ifstream in(input);
     if (!in) { std::cerr << "no puedo abrir " << input << "\n"; return 2; }
