@@ -1,3 +1,22 @@
+// solver.cpp — Puerto C++17 del AdjustedSolver.
+//
+// Mismo algoritmo que el Python medido (temp_scale 0.25, cooling 0.85,
+// 1-2 activado con tope 80, early-stop 6 restarts sin mejora, 8x10, seed 42):
+// greedy con denominador 1 + 0.5*grado_residual + 0.5*vecinos_peso/media,
+// mejora local con conteo incremental de conflictos (add, 1-1, 2-1, 1-2),
+// perturbación (soltar 25% + greedy repair con jitter) + recocido simulado.
+//
+// Pesos enteros exactos en micro-unidades (int64). RNG propio: std::mt19937
+// con seed 42 (secuencia distinta a la de Python random, misma distribución);
+// por eso los pesos pueden diferir ligeramente del Python: lo que se mide es
+// la distribución de gaps y la velocidad, no una reproducción bit a bit.
+//
+// Entrada (texto simple, enteros): n m, luego m líneas "u v" (0-based),
+// luego n pesos en micro-unidades (pueden ir en varias líneas).
+// Salida stdout: líneas "weight <score>", "time_s <s>", "vertices <v ...>".
+//
+// Compilar: g++ -O3 -std=c++17 -o refactor_v1 refactor_v1.cpp
+
 #include <algorithm>
 #include <chrono>
 #include <cmath>
