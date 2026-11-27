@@ -82,7 +82,7 @@ Medido, no estimado. Todas las cifras son reproducibles con los scripts del repo
 
 ### Contra KaMIS v3.2 (referencia de la literatura)
 
-Lote propio de 21 instancias (Erdős–Rényi n=50/100/200/400 y Barabási–Albert n=200/400, semillas 101/202/303, pesos enteros 1..10), cande C++ (`--seed 42 --reps 3 --mode multi`) contra `weighted_branch_reduce` (exacto, límite 30 s), `mmwis` y `weighted_local_search` (límite 10 s). Medido en sandbox con el mismo protocolo de la corrida en Kaggle (kernel `cande-vs-kamis-comparacion-mwis`); el peso de cada solución se recalcula desde los vértices y se verifica independencia.
+Lote propio de 21 instancias (Erdős–Rényi n=50/100/200/400 y Barabási–Albert n=200/400, semillas 101/202/303, pesos enteros 1..10), cande C++ (`--seed 42 --reps 3 --mode multi`) contra `weighted_branch_reduce` (exacto, límite 30 s), `mmwis` y `weighted_local_search` (límite 10 s). Corrido en Kaggle, kernel `cande-vs-kamis-comparacion-mwis`, sobre `main` 5e10592. El peso de cada solución se recalcula desde los vértices y se verifica independencia.
 
 | Métrica | Valor |
 |---|---|
@@ -91,7 +91,7 @@ Lote propio de 21 instancias (Erdős–Rényi n=50/100/200/400 y Barabási–Alb
 | Instancias en el óptimo exacto | 9 de 15 |
 | Gap medio vs mmwis (21/21) | 0.253% |
 | vs mmwis: gana / empata / pierde | 0 / 10 / 11 |
-| Tiempo medio cande | **0.070 s** |
+| Tiempo medio cande | **0.063 s** |
 | Tiempo medio exacto / mmwis | 8.806 s / 3.05 s |
 
 Por configuración, gap medio vs óptimo: er50 0.287%, er100_p05 0.0%, er100_p20 0.256%, ba200 0.099%, ba400 0.175%. En er200/er400 el exacto agota los 30 s (mejor conocido, no óptimo probado); cande supera ese mejor valor en 4 de 6 casos.
@@ -123,7 +123,7 @@ Python y C++ usan RNG distintos (`random` vs `mt19937`), así que los pesos pued
 
 ## Límites
 
-- **Es heurístico**: no hay garantía de optimalidad. En el lote de 21, el gap medio C++ es 0.164% y nunca supera a mmwis en calidad (0 victorias, 10 empates, 11 derrotas); a cambio es ~44x más rápido que mmwis (0.070 s vs 3.05 s de media).
+- **Es heurístico**: no hay garantía de optimalidad. En el lote de 21, el gap medio C++ es 0.164% y nunca supera a mmwis en calidad (0 victorias, 10 empates, 11 derrotas); a cambio es ~48x más rápido que mmwis (0.063 s vs 3.05 s de media).
 - **Configuración más débil**: er50 (gap 0.287%).
 - **Alcance medido**: n ≤ 400, pesos enteros 1..10, grafos ER/BA y 7 familias pequeñas. Sin mediciones en benchmarks públicos grandes o duros (BHOSLIB, DIMACS, PACE).
 - **El oráculo exacto (`solve_exact`)** solo es viable en instancias pequeñas; el exacto de KaMIS agota 30 s en ER200/ER400.
