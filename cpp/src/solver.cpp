@@ -1,10 +1,15 @@
-// solver.cpp — Puerto C++17 del AdjustedSolver.
+// tunel_t2.cpp — Puerto C++17 del AdjustedSolver con tunelamiento adaptativo ×2.
 //
-// Mismo algoritmo que el Python medido (temp_scale 0.25, cooling 0.85,
-// 1-2 activado con tope 80, early-stop 6 restarts sin mejora, 8x10, seed 42):
-// greedy con denominador 1 + 0.5*grado_residual + 0.5*vecinos_peso/media,
-// mejora local con conteo incremental de conflictos (add, 1-1, 2-1, 1-2),
-// perturbación (soltar 25% + greedy repair con jitter) + recocido simulado.
+// Misma base que refactor_v1_es6.cpp (temp_scale 0.25, cooling 0.85,
+// 1-2 activado con tope 80, early-stop 6 restarts sin mejora, 8x10, seed 42)
+// más el tunelamiento adaptativo del Python medido (es6 + túnel ×2, el mejor:
+// gap 0.096%, 11/15 en el óptimo):
+// - degree_cv: coeficiente de variación de los grados del grafo.
+// - _should_tunnel_extra: túnel extra solo si multiplier > 1, y no en
+//   grafos grandes con cv >= 1.0 (tipo BA n>=200); activo si n >= 100 o cv >= 0.35.
+// - En cada restart que no mejora la incumbente: UN solo intento extra de
+//   perturbación + mejora local completa desde el mejor actual (o desde cur
+//   si no hay mejor). Es el bloque original de un intento, no el de ×3.
 //
 // Pesos enteros exactos en micro-unidades (int64). RNG propio: std::mt19937
 // con seed 42 (secuencia distinta a la de Python random, misma distribución);
@@ -15,7 +20,7 @@
 // luego n pesos en micro-unidades (pueden ir en varias líneas).
 // Salida stdout: líneas "weight <score>", "time_s <s>", "vertices <v ...>".
 //
-// Compilar: g++ -O3 -std=c++17 -o refactor_v1 refactor_v1.cpp
+// Compilar: g++ -O3 -std=c++17 -o tunel_t2 tunel_t2.cpp
 
 #include <algorithm>
 #include <chrono>
@@ -93,9 +98,45 @@ struct AdjustedSolver {
     double initial_acceptance_p = 0.50;
     double temp_scale = 0.25;
     int early_stop_restarts = 6;
+    int tunnel_multiplier = 2;
+    double max_time_s = -1.0;  // < 0: sin presupuesto de tiempo.
+
+    // Coeficiente de variación de grados (inspirado en row_nnz_irregularity).
+    static double degree_cv(const Graph& g) {
+        int n = g.n;
+        if (n < 2) return 0.0;
+        double mean_d = 0.0;
+        for (int u = 0; u < n; ++u) mean_d += (double)g.adj[u].size();
+        mean_d /= (double)n;
+        if (mean_d <= 0.0) return 0.0;
+        double var_d = 0.0;
+        for (int u = 0; u < n; ++u) {
+            double d = (double)g.adj[u].size() - mean_d;
+            var_d += d * d;
+        }
+        var_d /= (double)n;
+        return std::sqrt(var_d) / mean_d;
+    }
+
+    // Activa el tunelamiento extra solo en regímenes donde aporta mayor ganancia.
+    bool should_tunnel_extra(int n, double cv) const {
+        if (tunnel_multiplier <= 1) return false;
+        // Evita tunelamiento extra costoso en grafos con fuerte asimetría
+        // de grados tipo BA grande.
+        if (cv >= 1.0 && n >= 200) return false;
+        // Prioriza grafos medianos/grandes con dispersión moderada (típicamente ER).
+        return n >= 100 || cv >= 0.35;
+    }
 
     std::pair<std::vector<int>, i64> solve(const Graph& g) {
         const auto& weights = g.w;
+        const auto t_start = std::chrono::steady_clock::now();
+        auto time_up = [&]() {
+            return max_time_s >= 0.0 &&
+                   std::chrono::duration<double>(std::chrono::steady_clock::now() - t_start).count() >= max_time_s;
+        };
+        double cv = degree_cv(g);
+        bool use_extra_tunnel = should_tunnel_extra(g.n, cv);
         Rng rng((unsigned)seed);
 
         std::set<int> best_set;
@@ -121,7 +162,10 @@ struct AdjustedSolver {
         double temp0 = -delta_typical / std::log(initial_acceptance_p);
 
         int restarts_without_gain = 0;
+        bool timed_out = false;
         for (int restart = 0; restart < n_restarts; ++restart) {
+            if (time_up()) { timed_out = true; break; }
+
             double jitter = (restart == 0) ? 0.0 : std::min(0.35, 0.05 * restart);
             std::set<int> sol = greedy_fill(g, std::set<int>(), rng, mean_w, jitter);
             auto pr = local_improve_fast(g, sol);
@@ -136,6 +180,8 @@ struct AdjustedSolver {
 
             double temp = temp0;
             for (int k = 0; k < n_perturbations; ++k) {
+                if (time_up()) { timed_out = true; break; }
+
                 auto cp = perturb_repair_fast(g, cur, rng, mean_w);
                 std::set<int> cand = cp.first;
                 i64 cand_w = cp.second;
@@ -150,10 +196,28 @@ struct AdjustedSolver {
                 temp *= cooling;
             }
 
+            if (timed_out) break;
+
             auto rf = local_improve_full(g, cur);
             if (better_solution(rf.second, rf.first, best_w, best_set)) {
                 best_set = rf.first; best_w = rf.second;
                 improved_this_restart = true;
+            }
+
+            // Segundo tunelamiento (× 2) condicional cuando el reinicio no mejoró la incumbente.
+            if (!improved_this_restart && use_extra_tunnel && !time_up()) {
+                std::set<int> base_sol = best_set.empty() ? cur : best_set;
+                auto tp = perturb_repair_fast(g, base_sol, rng, mean_w);
+                auto tf = local_improve_full(g, tp.first);
+                std::set<int> tun_cand = tf.first;
+                i64 tun_w = tf.second;
+                if (better_solution(tun_w, tun_cand, best_w, best_set)) {
+                    best_set = tun_cand; best_w = tun_w;
+                    improved_this_restart = true;
+                }
+                if (better_solution(tun_w, tun_cand, cur_w, cur)) {
+                    cur = tun_cand; cur_w = tun_w;
+                }
             }
 
             if (improved_this_restart) {
@@ -472,11 +536,13 @@ int main(int argc, char** argv) {
         else if (a == "--restarts") { if (!need(i)) return 2; solver.n_restarts = std::atoi(argv[++i]); }
         else if (a == "--perturbations") { if (!need(i)) return 2; solver.n_perturbations = std::atoi(argv[++i]); }
         else if (a == "--early-stop") { if (!need(i)) return 2; solver.early_stop_restarts = std::atoi(argv[++i]); }
+        else if (a == "--tunnel-mult") { if (!need(i)) return 2; solver.tunnel_multiplier = std::atoi(argv[++i]); }
+        else if (a == "--max-time-s") { if (!need(i)) return 2; solver.max_time_s = std::atof(argv[++i]); }
         else if (a == "--one-to-two") { if (!need(i)) return 2; solver.enable_one_to_two = std::atoi(argv[++i]) != 0; }
         else if (!a.empty() && a[0] != '-') input = a;
         else { std::cerr << "argumento desconocido: " << a << "\n"; return 2; }
     }
-    if (input.empty()) { std::cerr << "uso: ce_mwis <instancia.txt> [--seed N] [--reps R] [--mode multi|cont]\n"; return 2; }
+    if (input.empty()) { std::cerr << "uso: tunel_v1 <instancia.txt> [--seed N]\n"; return 2; }
 
     std::ifstream in(input);
     if (!in) { std::cerr << "no puedo abrir " << input << "\n"; return 2; }
